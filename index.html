@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="دفتر" />
+<meta name="theme-color" content="#0F3D3E" />
+<title>دفتر — محافظك وديونك</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=Cairo:wght@700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          teal: '#0F3D3E',
+          tealdark: '#0A2B2C',
+          brass: '#B8863B',
+          paper: '#F2ECDC',
+          card: '#FBF8EF',
+          ink: '#1E2A28',
+          rust: '#A6432F',
+          sage: '#4C7A5E',
+        },
+      },
+    },
+  };
+</script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { background: #F2ECDC; }
+  body { font-family: 'Tajawal', sans-serif; color: #1E2A28; -webkit-tap-highlight-color: transparent; }
+  .font-display { font-family: 'Cairo', 'Tajawal', sans-serif; }
+  ::selection { background: #B8863B55; }
+  input[type="number"] { -moz-appearance: textfield; }
+  input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+const STORAGE_KEY = 'daftar-state-v1';
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+function escapeHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+const fmt = (n) =>
+  new Intl.NumberFormat('ar-QA', { maximumFractionDigits: 2 }).format(
+    Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100
+  );
+
+function allocFor(cat, salary) {
+  if (cat.mode === 'amount') return Number(cat.amount || 0);
+  return (Number(salary || 0) * Number(cat.percent || 0)) / 100;
+}
+
+function debtPaid(debt) { return (debt.payments || []).reduce((s, p) => s + p.amount, 0); }
+function debtRemaining(debt) { return Number(debt.total || 0) - debtPaid(debt); }
+
+const ICON = (name) => {
+  if (name.includes('سفر')) return '✈️';
+  if (name.includes('أكل') || name.includes('اكل')) return '🍽️';
+  if (name.includes('بترول')) return '⛽';
+  if (name.includes('دين') || name.includes('التزام')) return '🤝';
+  if (name.includes('ليزر')) return '✨';
+  if (name.includes('ملابس')) return '👕';
+  return '👛';
+};
+
+function defaultCategories() {
+  return [
+    { id: uid(), name: 'السفر', mode: 'percent', percent: 15, amount: 0 },
+    { id: uid(), name: 'الأكل', mode: 'percent', percent: 25, amount: 0 },
+    { id: uid(), name: 'البترول', mode: 'percent', percent: 15, amount: 0 },
+    { id: uid(), name: 'الديون والالتزامات', mode: 'percent', percent: 10, amount: 0 },
+    { id: uid(), name: 'الليزر', mode: 'percent', percent: 10, amount: 0 },
+    { id: uid(), name: 'الملابس', mode: 'percent', percent: 15, amount: 0 },
+    { id: uid(), name: 'أخرى', mode: 'percent', percent: 10, amount: 0 },
+  ];
+}
+
+function emptyState() {
+  return {
+    onboarded: false,
+    salary: 0,
+    categories: defaultCategories(),
+    wallets: {},
+    transactions: [],
+    history: [],
+    debts: [],
+  };
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') return parsed;
+    }
+  } catch (e) {
+    console.error('load failed', e);
+  }
+  return emptyState();
+}
+
+let state = loadState();
+
+function saveState() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    console.error('save failed', e);
+    toast('تعذّر الحفظ — تأكد من مساحة التخزين', 'rust');
+  }
+}
+
+const ui = {
+  view: state.onboarded ? 'dashboard' : 'onboarding',
+  onboardStep: 0,
+  onboardSalary: '',
+  onboardCats: [],
+  settingsCats: null,
+  settingsDirty: false,
+  modal: null,
+  expenseCatId: null,
+  payDebtId: null,
+  debtExpanded: null,
+  toast: null,
+};
+
+let toastTimer = null;
+function toast(msg, tone) {
+  ui.toast = { msg, tone: tone || 'sage' };
+  renderToast();
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { ui.toast = null; renderToast(); }, 2200);
+}
+function renderToast() {
+  const el = document.getElementById('toast-root');
+  if (!el) return;
+  if (!ui.toast) { el.innerHTML = ''; return; }
+  const bg = ui.toast.tone === 'rust' ? '#A6432F' : '#4C7A5E';
+  el.innerHTML = `<div class="fixed top-4 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg shadow-lg text-sm font-bold z-50" style="background:${bg};color:#fff">${escapeHtml(ui.toast.msg)}</div>`;
+}
+
+function catRowHTML(cat, salary) {
+  const mode = cat.mode || 'percent';
+  const value = mode === 'amount' ? Number(cat.amount || 0) : Number(cat.percent || 0);
+  const preview = allocFor(cat, salary);
+  return `
+    <div class="rounded-lg p-2.5 bg-paper cat-row" id="cat-row-${cat.id}" data-cat-id="${cat.id}" data-mode="${mode}" data-percent="${Number(cat.percent||0)}" data-amount="${Number(cat.amount||0)}">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-md flex items-center justify-center shrink-0 bg-teal text-sm">${ICON(cat.name)}</div>
+        <input value="${escapeHtml(cat.name)}" class="flex-1 min-w-0 bg-transparent text-sm font-bold outline-none" oninput="onRowInput('${cat.id}')" data-role="name" />
+        <button onclick="removeCatRow('${cat.id}')" class="opacity-40 active:opacity-80 shrink-0 text-base">🗑️</button>
+      </div>
+      <div class="flex items-center gap-2 mt-2 flex-wrap">
+        <div class="flex rounded-md overflow-hidden shrink-0 border" style="border-color:#0F3D3E33">
+          <button type="button" onclick="setCatMode('${cat.id}','percent')" class="px-2 py-1 text-[11px] font-bold transition-colors" data-mode-btn="percent" style="background:${mode==='percent'?'#0F3D3E':'transparent'};color:${mode==='percent'?'#fff':'#0F3D3E'}">نسبة %</button>
+          <button type="button" onclick="setCatMode('${cat.id}','amount')" class="px-2 py-1 text-[11px] font-bold transition-colors" data-mode-btn="amount" style="background:${mode==='amount'?'#0F3D3E':'transparent'};color:${mode==='amount'?'#fff':'#0F3D3E'}">مبلغ ثابت</button>
+        </div>
+        <input type="number" value="${value}" class="w-16 text-center rounded-md py-1 text-sm font-bold outline-none shrink-0 border" style="border-color:#0F3D3E22" oninput="onRowInput('${cat.id}')" data-role="value" />
+        <span class="text-xs opacity-50 shrink-0" data-role="unit">${mode === 'percent' ? '%' : 'ر.ق'}</span>
+        <span class="text-[11px] opacity-50 shrink-0" data-role="preview">${mode === 'percent' ? '≈ ' + fmt(preview) + ' ر.ق' : ''}</span>
+      </div>
+    </div>`;
+}
+
+function readRow(rowEl) {
+  const id = rowEl.dataset.catId;
+  const mode = rowEl.dataset.mode;
+  const name = rowEl.querySelector('[data-role="name"]').value || 'محفظة';
+  const percent = Number(rowEl.dataset.percent || 0);
+  const amount = Number(rowEl.dataset.amount || 0);
+  return { id, name, mode, percent, amount };
+}
+
+function onRowInput(id) {
+  const row = document.getElementById('cat-row-' + id);
+  if (!row) return;
+  const mode = row.dataset.mode;
+  const valInput = row.querySelector('[data-role="value"]');
+  row.dataset[mode] = valInput.value;
+  const cat = readRow(row);
+  const salary = currentSalaryForContext();
+  const preview = row.querySelector('[data-role="preview"]');
+  preview.textContent = mode === 'percent' ? ('≈ ' + fmt(allocFor(cat, salary)) + ' ر.ق') : '';
+  recalcTotals();
+}
+
+function setCatMode(id, mode) {
+  const row = document.getElementById('cat-row-' + id);
+  if (!row) return;
+  row.dataset.mode = mode;
+  row.querySelectorAll('[data-mode-btn]').forEach((b) => {
+    const active = b.dataset.modeBtn === mode;
+    b.style.background = active ? '#0F3D3E' : 'transparent';
+    b.style.color = active ? '#fff' : '#0F3D3E';
+  });
+  const valInput = row.querySelector('[data-role="value"]');
+  valInput.value = row.dataset[mode] || 0;
+  row.querySelector('[data-role="unit"]').textContent = mode === 'percent' ? '%' : 'ر.ق';
+  const cat = readRow(row);
+  const salary = currentSalaryForContext();
+  row.querySelector('[data-role="preview"]').textContent = mode === 'percent' ? ('≈ ' + fmt(allocFor(cat, salary)) + ' ر.ق') : '';
+  recalcTotals();
+}
+
+function removeCatRow(id) {
+  const row = document.getElementById('cat-row-' + id);
+  if (row) row.remove();
+  recalcTotals();
+}
+
+function addCatRow() {
+  const container = document.getElementById('cat-rows-container');
+  if (!container) return;
+  const cat = { id: uid(), name: 'محفظة جديدة', mode: 'percent', percent: 0, amount: 0 };
+  container.insertAdjacentHTML('beforeend', catRowHTML(cat, currentSalaryForContext()));
+  recalcTotals();
+}
+
+function readAllRows() {
+  return [...document.querySelectorAll('#cat-rows-container .cat-row')].map(readRow);
+}
+
+function currentSalaryForContext() {
+  if (ui.view === 'onboarding') return Number(ui.onboardSalary || 0);
+  return Number(state.salary || 0);
+}
+
+function recalcTotals() {
+  const salary = currentSalaryForContext();
+  const cats = readAllRows();
+  const totalAllocated = cats.reduce((s, c) => s + allocFor(c, salary), 0);
+  const remaining = salary - totalAllocated;
+  const over = remaining < -0.01;
+  const badge = document.getElementById('totals-badge');
+  const submitBtn = document.getElementById('primary-submit-btn');
+  if (badge) {
+    badge.textContent = over ? `تجاوزت بـ ${fmt(Math.abs(remaining))} ر.ق` : `متبقي غير مخصص ${fmt(remaining)} ر.ق`;
+    badge.style.background = over ? '#A6432F22' : '#4C7A5E22';
+    badge.style.color = over ? '#A6432F' : '#4C7A5E';
+  }
+  if (submitBtn) submitBtn.disabled = over || cats.length === 0;
+}
+
+function onboardGoStep1() {
+  const input = document.getElementById('onboard-salary-input');
+  ui.onboardSalary = input.value;
+  if (!ui.onboardSalary || Number(ui.onboardSalary) <= 0) return;
+  ui.onboardStep = 1;
+  ui.onboardCats = state.categories && state.categories.length ? state.categories : defaultCategories();
+  render();
+}
+function onboardGoStep0() {
+  ui.onboardStep = 0;
+  render();
+}
+function onboardSubmit() {
+  const cats = readAllRows();
+  const salary = Number(ui.onboardSalary || 0);
+  const wallets = {};
+  cats.forEach((c) => { wallets[c.id] = { budget: allocFor(c, salary), spent: 0 }; });
+  state.onboarded = true;
+  state.salary = salary;
+  state.categories = cats;
+  state.wallets = wallets;
+  saveState();
+  ui.view = 'dashboard';
+  render();
+  toast('تم تجهيز محافظك، يعطيك العافية');
+}
+
+function renderOnboarding() {
+  if (ui.onboardStep === 0) {
+    return `
+      <div class="mb-6 text-center pt-2">
+        <h2 class="font-display text-2xl font-extrabold text-teal">نبدأ نرتب فلوسك</h2>
+        <p class="text-sm opacity-70 mt-1">خطوتين وبس، ونجهز لك المحافظ</p>
+      </div>
+      <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+        <label class="block text-sm font-bold mb-2">كم راتبك (أو دخلك) هذا الشهر؟</label>
+        <div class="relative">
+          <input id="onboard-salary-input" type="number" inputmode="decimal" value="${escapeHtml(ui.onboardSalary)}"
+            placeholder="مثال: 8000" autofocus
+            class="w-full rounded-lg px-4 py-3 text-lg font-bold outline-none border"
+            style="background:#F2ECDC;border-color:#0F3D3E22" />
+          <span class="absolute left-4 top-1/2 -translate-y-1/2 text-sm opacity-50 font-bold">ريال</span>
+        </div>
+        <button onclick="onboardGoStep1()" class="mt-5 w-full rounded-lg py-3 font-bold text-white bg-teal active:opacity-90">التالي</button>
+      </div>`;
+  }
+  const salary = Number(ui.onboardSalary || 0);
+  const rows = ui.onboardCats.map((c) => catRowHTML(c, salary)).join('');
+  return `
+    <div class="mb-6 text-center pt-2">
+      <h2 class="font-display text-2xl font-extrabold text-teal">نبدأ نرتب فلوسك</h2>
+      <p class="text-sm opacity-70 mt-1">خطوتين وبس، ونجهز لك المحافظ</p>
+    </div>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      <div class="flex items-center justify-between mb-1">
+        <label class="block text-sm font-bold">وزّع راتبك على المحافظ</label>
+        <span id="totals-badge" class="text-xs font-bold px-2 py-1 rounded"></span>
+      </div>
+      <p class="text-xs opacity-60 mb-4">لكل محفظة اختر نسبة % من راتبك أو مبلغ ثابت</p>
+      <div id="cat-rows-container" class="space-y-2.5 max-h-[46vh] overflow-y-auto pl-1">${rows}</div>
+      <button onclick="addCatRow()" class="mt-3 text-sm font-bold flex items-center gap-1.5 text-teal">➕ محفظة جديدة</button>
+      <div class="flex gap-2 mt-5">
+        <button onclick="onboardGoStep0()" class="rounded-lg px-4 py-3 font-bold bg-paper text-teal">رجوع</button>
+        <button id="primary-submit-btn" onclick="onboardSubmit()" class="flex-1 rounded-lg py-3 font-bold text-white bg-rust disabled:opacity-40">جهّز محافظي</button>
+      </div>
+    </div>`;
+}
+
+function openExpenseModal() {
+  ui.modal = 'expense';
+  ui.expenseCatId = state.categories[0] ? state.categories[0].id : null;
+  render();
+}
+function closeModal() { ui.modal = null; render(); }
+
+function selectExpenseCat(id) {
+  ui.expenseCatId = id;
+  document.querySelectorAll('.expense-cat-btn').forEach((b) => {
+    const active = b.dataset.catId === id;
+    b.style.background = active ? '#0F3D3E' : '#F2ECDC';
+    b.style.color = active ? '#fff' : '#1E2A28';
+  });
+  recalcExpensePreview();
+}
+function recalcExpensePreview() {
+  const amountInput = document.getElementById('expense-amount-input');
+  const preview = document.getElementById('expense-preview');
+  const submitBtn = document.getElementById('expense-submit-btn');
+  if (!amountInput || !preview) return;
+  const amount = Number(amountInput.value || 0);
+  const w = state.wallets[ui.expenseCatId] || { budget: 0, spent: 0 };
+  const projected = w.budget - w.spent - amount;
+  if (!amountInput.value) { preview.textContent = ''; }
+  else {
+    preview.textContent = projected < 0
+      ? `بيتبقى تجاوز قدره ${fmt(Math.abs(projected))} ر.ق`
+      : `بيتبقى ${fmt(projected)} ر.ق بعد الخصم`;
+    preview.style.background = projected < 0 ? '#A6432F18' : '#4C7A5E18';
+    preview.style.color = projected < 0 ? '#A6432F' : '#4C7A5E';
+  }
+  if (submitBtn) submitBtn.disabled = !amount || amount <= 0 || !ui.expenseCatId;
+}
+function submitExpense() {
+  const amountInput = document.getElementById('expense-amount-input');
+  const noteInput = document.getElementById('expense-note-input');
+  const amount = Number(amountInput.value || 0);
+  if (!amount || amount <= 0 || !ui.expenseCatId) return;
+  const catId = ui.expenseCatId;
+  const w = state.wallets[catId] || { budget: 0, spent: 0 };
+  state.wallets[catId] = { ...w, spent: w.spent + amount };
+  state.transactions.unshift({ id: uid(), catId, amount, note: noteInput.value || '', date: new Date().toISOString() });
+  saveState();
+  ui.modal = null;
+  render();
+  toast('تسجّل الخصم من المحفظة');
+}
+function deleteTransaction(txId) {
+  const tx = state.transactions.find((t) => t.id === txId);
+  if (!tx) return;
+  const w = state.wallets[tx.catId];
+  if (w) state.wallets[tx.catId] = { ...w, spent: Math.max(0, w.spent - tx.amount) };
+  state.transactions = state.transactions.filter((t) => t.id !== txId);
+  saveState();
+  render();
+}
+
+function openCloseMonthModal() { ui.modal = 'close'; render(); }
+function submitCloseMonth() {
+  const input = document.getElementById('close-salary-input');
+  const newSalary = Number(input.value || 0);
+  if (!newSalary || newSalary <= 0) return;
+  const rows = state.categories.map((c) => {
+    const w = state.wallets[c.id] || { budget: 0, spent: 0 };
+    return { catId: c.id, name: c.name, budget: w.budget, spent: w.spent, remaining: w.budget - w.spent };
+  });
+  state.history.unshift({ id: uid(), closedAt: new Date().toISOString(), salary: state.salary, rows });
+  const wallets = {};
+  state.categories.forEach((c) => {
+    const row = rows.find((r) => r.catId === c.id);
+    const rollover = row ? row.remaining : 0;
+    wallets[c.id] = { budget: allocFor(c, newSalary) + rollover, spent: 0 };
+  });
+  state.salary = newSalary;
+  state.wallets = wallets;
+  saveState();
+  ui.modal = null;
+  render();
+  toast('بدأنا شهر جديد بنفس التقسيمة');
+}
+
+function walletCardHTML(cat, wallet) {
+  const budget = wallet.budget || 0, spent = wallet.spent || 0;
+  const pct = budget > 0 ? Math.min(100, (spent / budget) * 100) : 0;
+  const remaining = budget - spent;
+  const over = remaining < 0;
+  const barColor = over ? '#A6432F' : (pct > 80 ? '#B8863B' : '#4C7A5E');
+  const modeLabel = (cat.mode || 'percent') === 'amount' ? 'مبلغ ثابت' : `${cat.percent}%`;
+  return `
+    <div class="rounded-2xl p-4 relative overflow-hidden bg-card border" style="border-color:#0F3D3E14">
+      <div class="absolute top-0 right-0 w-1.5 h-full" style="background:${over ? '#A6432F' : '#0F3D3E'}"></div>
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-lg flex items-center justify-center shrink-0 bg-teal text-lg">${ICON(cat.name)}</div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-baseline justify-between gap-2">
+            <span class="font-bold text-[15px] truncate">${escapeHtml(cat.name)}</span>
+            <span class="text-xs opacity-50 shrink-0">${modeLabel}</span>
+          </div>
+          <div class="text-xs opacity-60 mt-0.5">${fmt(spent)} من ${fmt(budget)} ر.ق</div>
+        </div>
+      </div>
+      <div class="mt-3 h-2 rounded-full overflow-hidden bg-paper">
+        <div class="h-full rounded-full transition-all duration-500" style="width:${pct}%;background:${barColor}"></div>
+      </div>
+      <div class="mt-2 flex items-center justify-between">
+        <span class="text-xs font-bold" style="color:${over ? '#A6432F' : '#4C7A5E'}">
+          ${over ? `تجاوزت بـ ${fmt(Math.abs(remaining))} ر.ق` : `متبقي ${fmt(remaining)} ر.ق`}
+        </span>
+      </div>
+    </div>`;
+}
+
+function renderDashboard() {
+  const totalBudget = state.categories.reduce((s, c) => s + ((state.wallets[c.id] || {}).budget || 0), 0);
+  const totalSpent = state.categories.reduce((s, c) => s + ((state.wallets[c.id] || {}).spent || 0), 0);
+  const totalRemaining = totalBudget - totalSpent;
+
+  const cards = state.categories.map((c) => walletCardHTML(c, state.wallets[c.id] || { budget: 0, spent: 0 })).join('');
+
+  const txRows = state.transactions.slice(0, 12).map((tx) => {
+    const cat = state.categories.find((c) => c.id === tx.catId);
+    return `
+      <div class="flex items-center gap-3 rounded-xl px-3 py-2.5 bg-card border" style="border-color:#0F3D3E10">
+        <div class="w-8 h-8 rounded-md flex items-center justify-center shrink-0 bg-paper text-sm">${cat ? ICON(cat.name) : '❓'}</div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-bold truncate">${cat ? escapeHtml(cat.name) : 'محفظة محذوفة'}</div>
+          ${tx.note ? `<div class="text-xs opacity-55 truncate">${escapeHtml(tx.note)}</div>` : ''}
+        </div>
+        <div class="text-sm font-extrabold shrink-0 text-rust">-${fmt(tx.amount)}</div>
+        <button onclick="deleteTransaction('${tx.id}')" class="opacity-30 active:opacity-70 shrink-0">🗑️</button>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="grid grid-cols-3 gap-2 mb-5">
+      <div class="rounded-xl px-2 py-3 text-center bg-card border" style="border-color:#0F3D3E12">
+        <div class="text-[11px] opacity-55 mb-1">الميزانية</div>
+        <div class="font-extrabold text-sm text-teal">${fmt(totalBudget)}</div>
+      </div>
+      <div class="rounded-xl px-2 py-3 text-center bg-card border" style="border-color:#0F3D3E12">
+        <div class="text-[11px] opacity-55 mb-1">المصروف</div>
+        <div class="font-extrabold text-sm text-rust">${fmt(totalSpent)}</div>
+      </div>
+      <div class="rounded-xl px-2 py-3 text-center bg-card border" style="border-color:#0F3D3E12">
+        <div class="text-[11px] opacity-55 mb-1">المتبقي</div>
+        <div class="font-extrabold text-sm" style="color:${totalRemaining >= 0 ? '#4C7A5E' : '#A6432F'}">${fmt(totalRemaining)}</div>
+      </div>
+    </div>
+    <div class="grid gap-3">${cards}</div>
+    <button onclick="openCloseMonthModal()" class="w-full mt-6 rounded-xl py-3 font-bold flex items-center justify-center gap-2 border-2 border-dashed text-teal" style="border-color:#0F3D3E44">
+      📅 إنهاء الشهر وبدء شهر جديد
+    </button>
+    ${state.transactions.length > 0 ? `
+      <div class="mt-8">
+        <h3 class="font-display font-extrabold text-sm mb-3 opacity-70">آخر الحركات</h3>
+        <div class="space-y-2">${txRows}</div>
+      </div>` : ''}
+  `;
+}
+
+function addDebt() {
+  const name = document.getElementById('debt-name-input').value;
+  const total = Number(document.getElementById('debt-total-input').value || 0);
+  const note = document.getElementById('debt-note-input').value;
+  if (!name || !total || total <= 0) return;
+  state.debts.unshift({ id: uid(), name, total, note: note || '', createdAt: new Date().toISOString(), payments: [] });
+  saveState();
+  ui.modal = null;
+  render();
+  toast('تمت إضافة الدين');
+}
+function deleteDebt(id) {
+  const debt = state.debts.find((d) => d.id === id);
+  if (!debt) return;
+  (debt.payments || []).forEach((p) => {
+    if (p.catId && state.wallets[p.catId]) {
+      state.wallets[p.catId] = { ...state.wallets[p.catId], spent: Math.max(0, state.wallets[p.catId].spent - p.amount) };
+    }
+  });
+  state.debts = state.debts.filter((d) => d.id !== id);
+  saveState();
+  render();
+}
+function openPayDebtModal(id) { ui.modal = 'payDebt'; ui.payDebtId = id; render(); }
+function selectPayCat(id) {
+  ui.payCatId = id;
+  document.querySelectorAll('.pay-cat-btn').forEach((b) => {
+    const active = b.dataset.catId === id;
+    b.style.background = active ? '#0F3D3E' : '#F2ECDC';
+    b.style.color = active ? '#fff' : '#1E2A28';
+  });
+}
+function submitPayment() {
+  const amount = Number(document.getElementById('payment-amount-input').value || 0);
+  const note = document.getElementById('payment-note-input').value;
+  if (!amount || amount <= 0) return;
+  const debtId = ui.payDebtId;
+  const catId = ui.payCatId || null;
+  const debt = state.debts.find((d) => d.id === debtId);
+  if (!debt) return;
+  debt.payments.unshift({ id: uid(), amount, note: note || '', date: new Date().toISOString(), catId });
+  if (catId) {
+    const w = state.wallets[catId] || { budget: 0, spent: 0 };
+    state.wallets[catId] = { ...w, spent: w.spent + amount };
+    state.transactions.unshift({ id: uid(), catId, amount, note: `دفعة دين: ${debt.name}`, date: new Date().toISOString() });
+  }
+  saveState();
+  ui.modal = null;
+  ui.payDebtId = null;
+  ui.payCatId = null;
+  render();
+  toast('تسجّلت الدفعة');
+}
+function deletePayment(debtId, paymentId) {
+  const debt = state.debts.find((d) => d.id === debtId);
+  if (!debt) return;
+  const payment = (debt.payments || []).find((p) => p.id === paymentId);
+  debt.payments = debt.payments.filter((p) => p.id !== paymentId);
+  if (payment && payment.catId && state.wallets[payment.catId]) {
+    state.wallets[payment.catId] = { ...state.wallets[payment.catId], spent: Math.max(0, state.wallets[payment.catId].spent - payment.amount) };
+  }
+  saveState();
+  render();
+}
+function toggleExpandDebt(id) {
+  ui.debtExpanded = ui.debtExpanded === id ? null : id;
+  render();
+}
+
+function renderDebts() {
+  if (state.debts.length === 0) {
+    return `
+      <div class="text-center py-16">
+        <div class="text-3xl mb-3 opacity-40">🤝</div>
+        <p class="text-sm opacity-60 mb-5">ما عندك ديون أو التزامات مسجّلة</p>
+        <button onclick="ui.modal='addDebt';render()" class="rounded-lg px-5 py-2.5 font-bold text-sm text-white bg-teal">+ تسجيل دين جديد</button>
+      </div>`;
+  }
+  const totalOwed = state.debts.reduce((s, d) => s + debtRemaining(d), 0);
+  const cards = state.debts.map((d) => {
+    const paid = debtPaid(d), remaining = debtRemaining(d);
+    const pct = d.total > 0 ? Math.min(100, (paid / d.total) * 100) : 0;
+    const settled = remaining <= 0;
+    const expanded = ui.debtExpanded === d.id;
+    const payments = (d.payments || []).map((p) => `
+      <div class="flex items-center justify-between text-xs">
+        <span class="opacity-60">${new Date(p.date).toLocaleDateString('ar-QA')}${p.note ? ' — ' + escapeHtml(p.note) : ''}</span>
+        <div class="flex items-center gap-2">
+          <span class="font-bold text-sage">${fmt(p.amount)} ر.ق</span>
+          <button onclick="deletePayment('${d.id}','${p.id}')" class="opacity-30 active:opacity-70">🗑️</button>
+        </div>
+      </div>`).join('');
+    return `
+      <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-lg flex items-center justify-center shrink-0 bg-teal text-lg">🤝</div>
+          <div class="flex-1 min-w-0">
+            <div class="font-bold text-[15px] truncate">${escapeHtml(d.name)}</div>
+            <div class="text-xs opacity-60 mt-0.5">اتسدد ${fmt(paid)} من ${fmt(d.total)} ر.ق</div>
+          </div>
+          <button onclick="deleteDebt('${d.id}')" class="opacity-30 active:opacity-70 shrink-0">🗑️</button>
+        </div>
+        <div class="mt-3 h-2 rounded-full overflow-hidden bg-paper">
+          <div class="h-full rounded-full transition-all duration-500" style="width:${pct}%;background:${settled ? '#4C7A5E' : '#B8863B'}"></div>
+        </div>
+        <div class="mt-2 flex items-center justify-between">
+          <span class="text-xs font-bold" style="color:${settled ? '#4C7A5E' : '#A6432F'}">
+            ${settled ? 'تم السداد بالكامل' : `المتبقي ${fmt(remaining)} ر.ق`}
+          </span>
+          <div class="flex items-center gap-3">
+            ${d.payments.length > 0 ? `<button onclick="toggleExpandDebt('${d.id}')" class="text-xs font-bold opacity-60">${expanded ? 'إخفاء الدفعات' : `الدفعات (${d.payments.length})`}</button>` : ''}
+            ${!settled ? `<button onclick="openPayDebtModal('${d.id}')" class="text-xs font-bold px-3 py-1.5 rounded-md text-white bg-teal">تسديد دفعة</button>` : ''}
+          </div>
+        </div>
+        ${expanded ? `<div class="mt-3 space-y-1.5 pt-3 border-t" style="border-color:#0F3D3E14">${payments}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="rounded-2xl px-4 py-3 mb-5 text-center bg-card border" style="border-color:#0F3D3E14">
+      <div class="text-[11px] opacity-55 mb-1">إجمالي المتبقي عليك</div>
+      <div class="font-extrabold text-lg" style="color:${totalOwed > 0 ? '#A6432F' : '#4C7A5E'}">${fmt(totalOwed)} ر.ق</div>
+    </div>
+    <div class="space-y-3">${cards}</div>`;
+}
+
+function renderHistory() {
+  if (state.history.length === 0) {
+    return `<div class="text-center py-16 opacity-50"><div class="text-2xl mb-3">🧾</div><p class="text-sm">ما فيه شهور مؤرشفة بعد</p></div>`;
+  }
+  const cards = state.history.map((h) => {
+    const totalSpent = h.rows.reduce((s, r) => s + r.spent, 0);
+    const totalBudget = h.rows.reduce((s, r) => s + r.budget, 0);
+    const rows = h.rows.map((r) => `
+      <div class="flex items-center justify-between text-xs">
+        <span class="opacity-80">${escapeHtml(r.name)}</span>
+        <span class="font-bold" style="color:${r.remaining < 0 ? '#A6432F' : '#4C7A5E'}">${r.remaining < 0 ? '-' : '+'}${fmt(Math.abs(r.remaining))} ر.ق</span>
+      </div>`).join('');
+    return `
+      <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+        <div class="flex items-center justify-between mb-2">
+          <span class="font-bold text-sm">أُرشف بتاريخ ${new Date(h.closedAt).toLocaleDateString('ar-QA')}</span>
+          <span class="text-xs opacity-60">راتب ${fmt(h.salary)} ر.ق</span>
+        </div>
+        <div class="text-xs opacity-60 mb-3">اتصرف ${fmt(totalSpent)} من ${fmt(totalBudget)} ر.ق</div>
+        <div class="space-y-1.5">${rows}</div>
+      </div>`;
+  }).join('');
+  return `<h2 class="font-display text-lg font-extrabold mb-1 text-teal">الأرشيف</h2><div class="space-y-4 mt-4">${cards}</div>`;
+}
+
+function settingsSave() {
+  const cats = readAllRows().map((c) => ({ ...c, percent: Number(c.percent), amount: Number(c.amount) }));
+  const wallets = { ...state.wallets };
+  cats.forEach((c) => { if (!wallets[c.id]) wallets[c.id] = { budget: 0, spent: 0 }; });
+  state.categories = cats;
+  state.wallets = wallets;
+  saveState();
+  render();
+  toast('تم حفظ التغييرات');
+}
+function settingsRebalance() {
+  const cats = readAllRows().map((c) => ({ ...c, percent: Number(c.percent), amount: Number(c.amount) }));
+  const wallets = {};
+  cats.forEach((c) => {
+    const prev = state.wallets[c.id] || { budget: 0, spent: 0 };
+    wallets[c.id] = { budget: allocFor(c, state.salary), spent: prev.spent };
+  });
+  state.categories = cats;
+  state.wallets = wallets;
+  saveState();
+  render();
+  toast('تحدّثت الميزانيات على التخصيص الجديد');
+}
+
+function renderSettings() {
+  const rows = state.categories.map((c) => catRowHTML(c, state.salary)).join('');
+  return `
+    <h2 class="font-display text-lg font-extrabold mb-1 text-teal">إعدادات المحافظ</h2>
+    <p class="text-xs opacity-60 mb-4">عدّل الأسماء، وحدد لكل محفظة نسبة % أو مبلغ ثابت.</p>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs font-bold opacity-70">التخصيص مقابل الراتب (${fmt(state.salary)} ر.ق)</span>
+        <span id="totals-badge" class="text-xs font-bold px-2 py-1 rounded"></span>
+      </div>
+      <div id="cat-rows-container" class="space-y-2.5">${rows}</div>
+      <button onclick="addCatRow()" class="mt-3 text-sm font-bold flex items-center gap-1.5 text-teal">➕ محفظة جديدة</button>
+      <div class="flex gap-2 mt-5">
+        <button id="primary-submit-btn" onclick="settingsSave()" class="flex-1 rounded-lg py-3 font-bold text-white bg-teal disabled:opacity-40">حفظ الأسماء والتخصيص</button>
+      </div>
+      <button onclick="settingsRebalance()" class="w-full mt-2 rounded-lg py-2.5 text-sm font-bold disabled:opacity-40 border-2 text-brass" style="border-color:#B8863B">
+        إعادة توزيع راتب هالشهر على التخصيص الجديد
+      </button>
+    </div>`;
+}
+
+function renderModals() {
+  if (ui.modal === 'expense') {
+    const cats = state.categories.map((c) => `
+      <button onclick="selectExpenseCat('${c.id}')" data-cat-id="${c.id}" class="expense-cat-btn rounded-xl p-2.5 flex flex-col items-center gap-1.5"
+        style="background:${c.id === ui.expenseCatId ? '#0F3D3E' : '#F2ECDC'};color:${c.id === ui.expenseCatId ? '#fff' : '#1E2A28'}">
+        <span class="text-base">${ICON(c.name)}</span>
+        <span class="text-[11px] font-bold truncate w-full text-center">${escapeHtml(c.name)}</span>
+      </button>`).join('');
+    return modalShell('تسجيل مصروف', `
+      <label class="block text-xs font-bold opacity-70 mb-2">من أي محفظة؟</label>
+      <div class="grid grid-cols-3 gap-2 mb-4">${cats}</div>
+      <label class="block text-xs font-bold opacity-70 mb-2">كم المبلغ؟</label>
+      <input id="expense-amount-input" type="number" inputmode="decimal" autofocus oninput="recalcExpensePreview()"
+        placeholder="0" class="w-full rounded-lg px-4 py-3 text-xl font-extrabold outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <input id="expense-note-input" placeholder="ملاحظة (اختياري) — مثال: بنطلون"
+        class="w-full rounded-lg px-4 py-2.5 text-sm outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <div id="expense-preview" class="text-xs font-bold rounded-lg px-3 py-2 mb-3"></div>
+      <button id="expense-submit-btn" onclick="submitExpense()" disabled class="w-full rounded-lg py-3 font-bold text-white bg-rust disabled:opacity-40">خصم من المحفظة</button>
+    `);
+  }
+  if (ui.modal === 'close') {
+    const rows = state.categories.map((c) => {
+      const w = state.wallets[c.id] || { budget: 0, spent: 0 };
+      const remaining = w.budget - w.spent;
+      return `<div class="flex items-center justify-between px-3 py-2 text-sm border-b" style="border-color:#0F3D3E10">
+        <span class="font-bold">${escapeHtml(c.name)}</span>
+        <span class="font-bold" style="color:${remaining < 0 ? '#A6432F' : '#4C7A5E'}">${remaining < 0 ? '-' : '+'}${fmt(Math.abs(remaining))} ر.ق</span>
+      </div>`;
+    }).join('');
+    return modalShell('إنهاء الشهر', `
+      <p class="text-sm opacity-70 mb-4">بيتم أرشفة هالشهر، والمتبقي من كل محفظة بيترحّل ويُضاف له من راتبك الجديد بنفس التخصيص.</p>
+      <div class="rounded-lg mb-4 max-h-40 overflow-y-auto bg-paper">${rows}</div>
+      <label class="block text-xs font-bold opacity-70 mb-2">راتب الشهر الجديد</label>
+      <input id="close-salary-input" type="number" inputmode="decimal" value="${state.salary || ''}"
+        class="w-full rounded-lg px-4 py-3 text-lg font-extrabold outline-none mb-4 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <button onclick="submitCloseMonth()" class="w-full rounded-lg py-3 font-bold text-white bg-teal">ابدأ الشهر الجديد</button>
+    `);
+  }
+  if (ui.modal === 'addDebt') {
+    return modalShell('دين أو التزام جديد', `
+      <label class="block text-xs font-bold opacity-70 mb-2">لمن أو وش سبب الدين؟</label>
+      <input id="debt-name-input" placeholder="مثال: قرض من سالم" autofocus
+        class="w-full rounded-lg px-4 py-2.5 text-sm font-bold outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <label class="block text-xs font-bold opacity-70 mb-2">المبلغ الإجمالي</label>
+      <input id="debt-total-input" type="number" inputmode="decimal" placeholder="0"
+        class="w-full rounded-lg px-4 py-3 text-xl font-extrabold outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <input id="debt-note-input" placeholder="ملاحظة (اختياري)"
+        class="w-full rounded-lg px-4 py-2.5 text-sm outline-none mb-4 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <button onclick="addDebt()" class="w-full rounded-lg py-3 font-bold text-white bg-teal">إضافة</button>
+    `);
+  }
+  if (ui.modal === 'payDebt') {
+    const debt = state.debts.find((d) => d.id === ui.payDebtId);
+    if (!debt) return '';
+    const catBtns = `<button onclick="selectPayCat(null)" class="pay-cat-btn px-3 py-1.5 rounded-md text-xs font-bold" data-cat-id="" style="background:#0F3D3E;color:#fff">بدون خصم</button>` +
+      state.categories.map((c) => `<button onclick="selectPayCat('${c.id}')" data-cat-id="${c.id}" class="pay-cat-btn px-3 py-1.5 rounded-md text-xs font-bold" style="background:#F2ECDC;color:#1E2A28">${escapeHtml(c.name)}</button>`).join('');
+    return modalShell(`تسديد دفعة — ${escapeHtml(debt.name)}`, `
+      <div class="text-xs opacity-60 mb-3">المتبقي حاليًا: ${fmt(debtRemaining(debt))} ر.ق</div>
+      <label class="block text-xs font-bold opacity-70 mb-2">كم دفعت؟</label>
+      <input id="payment-amount-input" type="number" inputmode="decimal" autofocus placeholder="0"
+        class="w-full rounded-lg px-4 py-3 text-xl font-extrabold outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <input id="payment-note-input" placeholder="ملاحظة (اختياري)"
+        class="w-full rounded-lg px-4 py-2.5 text-sm outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <label class="block text-xs font-bold opacity-70 mb-2">تخصمها من محفظة؟ (اختياري)</label>
+      <div class="flex flex-wrap gap-2 mb-4">${catBtns}</div>
+      <button onclick="submitPayment()" class="w-full rounded-lg py-3 font-bold text-white bg-rust">تسجيل الدفعة</button>
+    `);
+  }
+  return '';
+}
+function modalShell(title, body) {
+  return `
+    <div class="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4" style="background:rgba(15,43,44,0.55)" onclick="if(event.target===this) closeModal()">
+      <div class="w-full sm:max-w-sm rounded-t-2xl sm:rounded-2xl p-5 max-h-[90vh] overflow-y-auto bg-card safe-bottom">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-display font-extrabold text-base text-teal">${escapeHtml(title)}</h3>
+          <button onclick="closeModal()" class="opacity-50 active:opacity-90 text-lg">✕</button>
+        </div>
+        ${body}
+      </div>
+    </div>`;
+}
+
+function setView(v) { ui.view = v; ui.modal = null; render(); }
+function tabBtn(view, label) {
+  const active = ui.view === view;
+  return `<button onclick="setView('${view}')" class="text-[12px] px-2 py-1.5 rounded-md font-medium whitespace-nowrap transition-colors"
+    style="background:${active ? 'rgba(184,134,59,0.25)' : 'transparent'};color:${active ? '#B8863B' : 'rgba(255,255,255,0.65)'}">${label}</button>`;
+}
+function renderHeader() {
+  if (ui.view === 'onboarding') return '';
+  return `
+    <header class="bg-teal text-white">
+      <div class="max-w-2xl mx-auto px-4 pt-6 pb-4">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2.5">
+            <div class="w-9 h-9 rounded-md flex items-center justify-center bg-brass text-base">🐷</div>
+            <h1 class="font-display text-xl font-extrabold tracking-tight">دفتر</h1>
+          </div>
+          <div class="flex gap-1">
+            ${tabBtn('dashboard', 'المحافظ')}
+            ${tabBtn('debts', 'الديون')}
+            ${tabBtn('history', 'الأرشيف')}
+            ${tabBtn('settings', 'الإعدادات')}
+          </div>
+        </div>
+      </div>
+      <div style="height:3px;background:linear-gradient(90deg,transparent,#B8863B,transparent)"></div>
+    </header>`;
+}
+
+function renderFab() {
+  if (ui.view === 'dashboard') {
+    return `<button onclick="openExpenseModal()" class="fixed bottom-6 left-6 rounded-full shadow-lg flex items-center gap-2 px-5 py-3.5 active:scale-95 transition-transform text-paper bg-rust safe-bottom">
+      <span class="text-lg">➕</span><span class="font-bold">تسجيل مصروف</span>
+    </button>`;
+  }
+  if (ui.view === 'debts' && state.debts.length > 0) {
+    return `<button onclick="ui.modal='addDebt';render()" class="fixed bottom-6 left-6 rounded-full shadow-lg flex items-center gap-2 px-5 py-3.5 active:scale-95 transition-transform text-paper bg-rust safe-bottom">
+      <span class="text-lg">➕</span><span class="font-bold">دين جديد</span>
+    </button>`;
+  }
+  return '';
+}
+
+function render() {
+  let main = '';
+  if (ui.view === 'onboarding') main = renderOnboarding();
+  else if (ui.view === 'dashboard') main = renderDashboard();
+  else if (ui.view === 'debts') main = renderDebts();
+  else if (ui.view === 'history') main = renderHistory();
+  else if (ui.view === 'settings') main = renderSettings();
+
+  document.getElementById('app').innerHTML = `
+    ${renderHeader()}
+    <main class="max-w-2xl mx-auto px-4 pb-28 pt-5">${main}</main>
+    ${renderFab()}
+    <div id="modal-root">${renderModals()}</div>
+    <div id="toast-root"></div>
+  `;
+
+  if (ui.view === 'onboarding' && ui.onboardStep === 1) recalcTotals();
+  if (ui.view === 'settings') recalcTotals();
+  renderToast();
+}
+
+render();
+</script>
+</body>
+</html>
