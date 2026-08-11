@@ -45,14 +45,7 @@
 <div id="app"></div>
 
 <script>
-/* =========================================================
-   دفتر — Standalone offline ledger (vanilla JS + localStorage)
-   Palette: teal #0F3D3E, brass #B8863B, paper #F2ECDC,
-            card #FBF8EF, ink #1E2A28, rust #A6432F, sage #4C7A5E
-========================================================= */
-
 const STORAGE_KEY = 'daftar-state-v1';
-
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 function escapeHtml(str) {
@@ -143,7 +136,6 @@ async function hashPassword(pw) {
     const buf = await crypto.subtle.digest('SHA-256', enc);
     return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
   } catch (e) {
-    // fallback for non-secure contexts where crypto.subtle is unavailable
     let h = 0;
     for (let i = 0; i < pw.length; i++) { h = (h * 31 + pw.charCodeAt(i)) >>> 0; }
     return 'fb' + h.toString(16);
@@ -342,7 +334,7 @@ const ui = {
   onboardCats: [],
   settingsCats: null,
   settingsDirty: false,
-  modal: null, // 'expense' | 'close' | 'addDebt' | 'payDebt'
+  modal: null,
   expenseCatId: null,
   payDebtId: null,
   debtExpanded: null,
@@ -350,7 +342,6 @@ const ui = {
   toast: null,
 };
 
-/* ---------------- toast ---------------- */
 let toastTimer = null;
 function toast(msg, tone) {
   ui.toast = { msg, tone: tone || 'sage' };
@@ -366,7 +357,6 @@ function renderToast() {
   el.innerHTML = `<div class="fixed top-4 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg shadow-lg text-sm font-bold z-50" style="background:${bg};color:#fff">${escapeHtml(ui.toast.msg)}</div>`;
 }
 
-/* ---------------- category row (shared: onboarding + settings) ---------------- */
 function catRowHTML(cat, salary) {
   const mode = cat.mode || 'percent';
   const value = mode === 'amount' ? Number(cat.amount || 0) : Number(cat.percent || 0);
@@ -469,7 +459,6 @@ function recalcTotals() {
   if (submitBtn) submitBtn.disabled = over || cats.length === 0;
 }
 
-/* ---------------- onboarding ---------------- */
 function onboardGoStep1() {
   const input = document.getElementById('onboard-salary-input');
   ui.onboardSalary = input.value;
@@ -498,7 +487,6 @@ function onboardSubmit() {
   toast('تم تجهيز محافظك، يعطيك العافية');
 }
 
-/* ---------------- accounts UI ---------------- */
 function renderAccountSelect() {
   const accounts = loadAccounts();
   const list = accounts.map((a) => `
@@ -685,7 +673,6 @@ function renderOnboarding() {
     </div>`;
 }
 
-/* ---------------- dashboard ---------------- */
 function openExpenseModal() {
   ui.modal = 'expense';
   ui.expenseCatId = state.categories[0] ? state.categories[0].id : null;
@@ -728,17 +715,90 @@ function submitExpense() {
   const catId = ui.expenseCatId;
   const w = state.wallets[catId] || { budget: 0, spent: 0 };
   state.wallets[catId] = { ...w, spent: w.spent + amount };
-  state.transactions.unshift({ id: uid(), catId, amount, note: noteInput.value || '', date: new Date().toISOString() });
+  state.transactions.unshift({ id: uid(), type: 'expense', catId, amount, note: noteInput.value || '', date: new Date().toISOString() });
   saveState();
   ui.modal = null;
   render();
   toast('تسجّل الخصم من المحفظة');
 }
+
+function openIncomeModal() {
+  ui.modal = 'income';
+  ui.incomeMode = 'distribute';
+  ui.incomeCatId = state.categories[0] ? state.categories[0].id : null;
+  render();
+}
+function setIncomeMode(mode) {
+  ui.incomeMode = mode;
+  render();
+}
+function selectIncomeCat(id) {
+  ui.incomeCatId = id;
+  document.querySelectorAll('.income-cat-btn').forEach((b) => {
+    const active = b.dataset.catId === id;
+    b.style.background = active ? '#0F3D3E' : '#F2ECDC';
+    b.style.color = active ? '#fff' : '#1E2A28';
+  });
+}
+function recalcIncomePreview() {
+  const amountInput = document.getElementById('income-amount-input');
+  if (!amountInput) return;
+  const amount = Number(amountInput.value || 0);
+  state.categories.forEach((c) => {
+    if ((c.mode || 'percent') === 'percent' && Number(c.percent) > 0) {
+      const el = document.getElementById('income-preview-' + c.id);
+      if (el) el.textContent = '+' + fmt((amount * Number(c.percent)) / 100) + ' ر.ق';
+    }
+  });
+}
+function submitIncome() {
+  const amountInput = document.getElementById('income-amount-input');
+  const noteInput = document.getElementById('income-note-input');
+  const amount = Number(amountInput.value || 0);
+  if (!amount || amount <= 0) return;
+  const note = noteInput.value || '';
+  const date = new Date().toISOString();
+
+  if (ui.incomeMode === 'single') {
+    if (!ui.incomeCatId) return;
+    const w = state.wallets[ui.incomeCatId] || { budget: 0, spent: 0 };
+    state.wallets[ui.incomeCatId] = { ...w, budget: w.budget + amount };
+    state.transactions.unshift({ id: uid(), type: 'income', catId: ui.incomeCatId, amount, note, date });
+  } else {
+    const shares = {};
+    state.categories.forEach((c) => {
+      if ((c.mode || 'percent') === 'percent' && Number(c.percent) > 0) {
+        const share = (amount * Number(c.percent)) / 100;
+        const w = state.wallets[c.id] || { budget: 0, spent: 0 };
+        state.wallets[c.id] = { ...w, budget: w.budget + share };
+        shares[c.id] = share;
+      }
+    });
+    state.transactions.unshift({ id: uid(), type: 'income', catId: null, distributedShares: shares, amount, note, date });
+  }
+  saveState();
+  ui.modal = null;
+  render();
+  toast('تمت إضافة الدخل الإضافي');
+}
+
 function deleteTransaction(txId) {
   const tx = state.transactions.find((t) => t.id === txId);
   if (!tx) return;
-  const w = state.wallets[tx.catId];
-  if (w) state.wallets[tx.catId] = { ...w, spent: Math.max(0, w.spent - tx.amount) };
+  if (tx.type === 'income') {
+    if (tx.catId) {
+      const w = state.wallets[tx.catId];
+      if (w) state.wallets[tx.catId] = { ...w, budget: Math.max(0, w.budget - tx.amount) };
+    } else if (tx.distributedShares) {
+      Object.entries(tx.distributedShares).forEach(([catId, share]) => {
+        const w = state.wallets[catId];
+        if (w) state.wallets[catId] = { ...w, budget: Math.max(0, w.budget - share) };
+      });
+    }
+  } else {
+    const w = state.wallets[tx.catId];
+    if (w) state.wallets[tx.catId] = { ...w, spent: Math.max(0, w.spent - tx.amount) };
+  }
   state.transactions = state.transactions.filter((t) => t.id !== txId);
   saveState();
   render();
@@ -826,15 +886,20 @@ function txListHTML(txs, deletable) {
       <div class="text-[11px] font-bold opacity-50 mb-1.5">${g.label}</div>
       <div class="space-y-1.5">
         ${g.txs.map((tx) => {
-          const cat = state.categories.find((c) => c.id === tx.catId);
+          const isIncome = tx.type === 'income';
+          const cat = tx.catId ? state.categories.find((c) => c.id === tx.catId) : null;
+          const label = isIncome
+            ? (cat ? escapeHtml(cat.name) : (tx.catId ? 'محفظة محذوفة' : 'دخل موزّع على كل المحافظ'))
+            : (cat ? escapeHtml(cat.name) : 'محفظة محذوفة');
+          const icon = isIncome ? '💵' : (cat ? ICON(cat.name) : '❓');
           return `
             <div class="flex items-center gap-3 rounded-xl px-3 py-2.5 bg-card border" style="border-color:#0F3D3E10">
-              <div class="w-8 h-8 rounded-md flex items-center justify-center shrink-0 bg-paper text-sm">${cat ? ICON(cat.name) : '❓'}</div>
+              <div class="w-8 h-8 rounded-md flex items-center justify-center shrink-0 bg-paper text-sm">${icon}</div>
               <div class="flex-1 min-w-0">
-                <div class="text-sm font-bold truncate">${cat ? escapeHtml(cat.name) : 'محفظة محذوفة'}</div>
+                <div class="text-sm font-bold truncate">${label}</div>
                 ${tx.note ? `<div class="text-xs opacity-55 truncate">${escapeHtml(tx.note)}</div>` : ''}
               </div>
-              <div class="text-sm font-extrabold shrink-0 text-rust">-${fmt(tx.amount)}</div>
+              <div class="text-sm font-extrabold shrink-0" style="color:${isIncome ? '#4C7A5E' : '#A6432F'}">${isIncome ? '+' : '-'}${fmt(tx.amount)}</div>
               ${deletable ? `<button onclick="deleteTransaction('${tx.id}')" class="opacity-30 active:opacity-70 shrink-0">🗑️</button>` : ''}
             </div>`;
         }).join('')}
@@ -868,9 +933,14 @@ function renderDashboard() {
       </div>
     </div>
     <div class="grid gap-3">${cards}</div>
-    <button onclick="openCloseMonthModal()" class="w-full mt-6 rounded-xl py-3 font-bold flex items-center justify-center gap-2 border-2 border-dashed text-teal" style="border-color:#0F3D3E44">
-      📅 إنهاء الشهر وبدء شهر جديد
-    </button>
+    <div class="grid grid-cols-2 gap-2 mt-6">
+      <button onclick="openIncomeModal()" class="rounded-xl py-3 font-bold flex items-center justify-center gap-1.5 border-2 border-dashed text-sage" style="border-color:#4C7A5E44">
+        💵 دخل إضافي
+      </button>
+      <button onclick="openCloseMonthModal()" class="rounded-xl py-3 font-bold flex items-center justify-center gap-1.5 border-2 border-dashed text-teal" style="border-color:#0F3D3E44">
+        📅 إنهاء الشهر
+      </button>
+    </div>
     <div class="mt-8">
       <h3 class="font-display font-extrabold text-sm mb-3 opacity-70">حركات هالفترة (بالتاريخ)</h3>
       ${txListHTML(currentTxs, true)}
@@ -878,7 +948,6 @@ function renderDashboard() {
   `;
 }
 
-/* ---------------- debts ---------------- */
 function addDebt() {
   const name = document.getElementById('debt-name-input').value;
   const total = Number(document.getElementById('debt-total-input').value || 0);
@@ -1005,7 +1074,6 @@ function renderDebts() {
     <div class="space-y-3">${cards}</div>`;
 }
 
-/* ---------------- history ---------------- */
 function toggleHistoryExpand(id) {
   ui.historyExpanded = ui.historyExpanded === id ? null : id;
   render();
@@ -1044,7 +1112,6 @@ function renderHistory() {
   return `<h2 class="font-display text-lg font-extrabold mb-1 text-teal">الأرشيف</h2><div class="space-y-4 mt-4">${cards}</div>`;
 }
 
-/* ---------------- settings ---------------- */
 function settingsSave() {
   const cats = readAllRows().map((c) => ({ ...c, percent: Number(c.percent), amount: Number(c.amount) }));
   const wallets = { ...state.wallets };
@@ -1090,8 +1157,40 @@ function renderSettings() {
     </div>`;
 }
 
-/* ---------------- modals ---------------- */
 function renderModals() {
+  if (ui.modal === 'income') {
+    const distributeActive = ui.incomeMode === 'distribute';
+    const percentCats = state.categories.filter((c) => (c.mode || 'percent') === 'percent' && Number(c.percent) > 0);
+    const previewRows = percentCats.map((c) => `
+      <div class="flex items-center justify-between text-xs py-1">
+        <span class="opacity-70">${escapeHtml(c.name)} (${c.percent}%)</span>
+        <span id="income-preview-${c.id}" class="font-bold text-sage">+0 ر.ق</span>
+      </div>`).join('');
+    const singleCats = state.categories.map((c) => `
+      <button onclick="selectIncomeCat('${c.id}')" data-cat-id="${c.id}" class="income-cat-btn rounded-xl p-2.5 flex flex-col items-center gap-1.5"
+        style="background:${c.id === ui.incomeCatId ? '#0F3D3E' : '#F2ECDC'};color:${c.id === ui.incomeCatId ? '#fff' : '#1E2A28'}">
+        <span class="text-base">${ICON(c.name)}</span>
+        <span class="text-[11px] font-bold truncate w-full text-center">${escapeHtml(c.name)}</span>
+      </button>`).join('');
+    return modalShell('دخل إضافي', `
+      <label class="block text-xs font-bold opacity-70 mb-2">كم المبلغ؟</label>
+      <input id="income-amount-input" type="number" inputmode="decimal" autofocus oninput="recalcIncomePreview()"
+        placeholder="0" class="w-full rounded-lg px-4 py-3 text-xl font-extrabold outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <input id="income-note-input" placeholder="ملاحظة (اختياري) — مثال: أرباح"
+        class="w-full rounded-lg px-4 py-2.5 text-sm outline-none mb-3 border" style="background:#F2ECDC;border-color:#0F3D3E22" />
+
+      <div class="flex rounded-md overflow-hidden mb-3 border" style="border-color:#0F3D3E33">
+        <button type="button" onclick="setIncomeMode('distribute')" class="flex-1 px-2 py-2 text-xs font-bold" style="background:${distributeActive ? '#0F3D3E' : 'transparent'};color:${distributeActive ? '#fff' : '#0F3D3E'}">وزّعها على المحافظ</button>
+        <button type="button" onclick="setIncomeMode('single')" class="flex-1 px-2 py-2 text-xs font-bold" style="background:${!distributeActive ? '#0F3D3E' : 'transparent'};color:${!distributeActive ? '#fff' : '#0F3D3E'}">حطها بمحفظة وحدة</button>
+      </div>
+
+      ${distributeActive
+        ? `<div class="rounded-lg p-3 mb-3 bg-paper" id="income-distribute-preview">${previewRows || '<p class="text-xs opacity-50">ما فيه محافظ نسبية توزع عليها</p>'}</div>`
+        : `<div class="grid grid-cols-3 gap-2 mb-3">${singleCats}</div>`}
+
+      <button onclick="submitIncome()" class="w-full rounded-lg py-3 font-bold text-white bg-sage" style="background:#4C7A5E">إضافة الدخل</button>
+    `);
+  }
   if (ui.modal === 'expense') {
     const cats = state.categories.map((c) => `
       <button onclick="selectExpenseCat('${c.id}')" data-cat-id="${c.id}" class="expense-cat-btn rounded-xl p-2.5 flex flex-col items-center gap-1.5"
@@ -1174,7 +1273,6 @@ function modalShell(title, body) {
     </div>`;
 }
 
-/* ---------------- header / shell ---------------- */
 function setView(v) { ui.view = v; ui.modal = null; render(); }
 function tabBtn(view, label) {
   const active = ui.view === view;
@@ -1223,7 +1321,6 @@ function renderFab() {
 }
 
 function render() {
-  // gate: must be logged in for anything except the auth screens
   if (!session.accountId && !AUTH_VIEWS.includes(ui.view)) {
     ui.view = legacyDataPending() ? 'migrate' : 'accountSelect';
   }
