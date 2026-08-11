@@ -45,7 +45,14 @@
 <div id="app"></div>
 
 <script>
+/* =========================================================
+   دفتر — Standalone offline ledger (vanilla JS + localStorage)
+   Palette: teal #0F3D3E, brass #B8863B, paper #F2ECDC,
+            card #FBF8EF, ink #1E2A28, rust #A6432F, sage #4C7A5E
+========================================================= */
+
 const STORAGE_KEY = 'daftar-state-v1';
+
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 function escapeHtml(str) {
@@ -93,6 +100,7 @@ function emptyState() {
   return {
     onboarded: false,
     salary: 0,
+    createdAt: null,
     categories: defaultCategories(),
     wallets: {},
     transactions: [],
@@ -114,31 +122,235 @@ function loadState() {
   return emptyState();
 }
 
-let state = loadState();
+/* ---------------- accounts (multi-user, password-protected, isolated data) ---------------- */
+const ACCOUNTS_KEY = 'daftar-accounts-v1';
+const stateKeyFor = (accountId) => STORAGE_KEY + '::' + accountId;
+
+function loadAccounts() {
+  try {
+    const raw = localStorage.getItem(ACCOUNTS_KEY);
+    if (raw) { const parsed = JSON.parse(raw); if (Array.isArray(parsed)) return parsed; }
+  } catch (e) { console.error('accounts load failed', e); }
+  return [];
+}
+function saveAccounts(accounts) {
+  try { localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts)); }
+  catch (e) { console.error('accounts save failed', e); }
+}
+async function hashPassword(pw) {
+  try {
+    const enc = new TextEncoder().encode(pw);
+    const buf = await crypto.subtle.digest('SHA-256', enc);
+    return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  } catch (e) {
+    // fallback for non-secure contexts where crypto.subtle is unavailable
+    let h = 0;
+    for (let i = 0; i < pw.length; i++) { h = (h * 31 + pw.charCodeAt(i)) >>> 0; }
+    return 'fb' + h.toString(16);
+  }
+}
+function loadStateFor(accountId) {
+  try {
+    const raw = localStorage.getItem(stateKeyFor(accountId));
+    if (raw) { const parsed = JSON.parse(raw); if (parsed && typeof parsed === 'object') return parsed; }
+  } catch (e) { console.error('load failed', e); }
+  return emptyState();
+}
+
+const session = { accountId: null, accountName: null };
+let pendingAccountId = null;
+
+let state = emptyState();
 
 function saveState() {
+  if (!session.accountId) return;
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem(stateKeyFor(session.accountId), JSON.stringify(state));
   } catch (e) {
     console.error('save failed', e);
     toast('تعذّر الحفظ — تأكد من مساحة التخزين', 'rust');
   }
 }
 
+function resetOnboardUi() {
+  ui.onboardStep = 0;
+  ui.onboardSalary = '';
+  ui.onboardCats = [];
+}
+
+function logout() {
+  session.accountId = null;
+  session.accountName = null;
+  state = emptyState();
+  ui.view = 'accountSelect';
+  ui.modal = null;
+  resetOnboardUi();
+  render();
+}
+
+function selectAccount(id) { pendingAccountId = id; ui.view = 'accountPassword'; render(); }
+
+async function submitLogin() {
+  const pwInput = document.getElementById('login-password-input');
+  const pw = pwInput.value;
+  const accounts = loadAccounts();
+  const acc = accounts.find((a) => a.id === pendingAccountId);
+  if (!acc) return;
+  const hash = await hashPassword(pw);
+  if (hash !== acc.passwordHash) {
+    document.getElementById('login-error').textContent = 'كلمة المرور غلط';
+    return;
+  }
+  session.accountId = acc.id;
+  session.accountName = acc.name;
+  state = loadStateFor(acc.id);
+  resetOnboardUi();
+  ui.view = state.onboarded ? 'dashboard' : 'onboarding';
+  render();
+}
+
+async function submitCreateAccount() {
+  const name = document.getElementById('create-name-input').value.trim();
+  const pw = document.getElementById('create-pw-input').value;
+  const pw2 = document.getElementById('create-pw2-input').value;
+  const question = document.getElementById('create-question-input').value.trim();
+  const answer = document.getElementById('create-answer-input').value.trim();
+  const err = document.getElementById('create-error');
+  if (!name) { err.textContent = 'اكتب اسمك'; return; }
+  if (!/^\d{4}$/.test(pw)) { err.textContent = 'الرمز السري لازم يكون 4 أرقام بالضبط'; return; }
+  if (pw !== pw2) { err.textContent = 'كلمتا المرور مو متطابقتين'; return; }
+  if (!question || !answer) { err.textContent = 'سؤال الأمان والإجابة مطلوبين عشان تقدر تسترجع حسابك لو نسيت الرمز'; return; }
+  const accounts = loadAccounts();
+  if (accounts.some((a) => a.name === name)) { err.textContent = 'فيه حساب بنفس الاسم'; return; }
+  const hash = await hashPassword(pw);
+  const answerHash = await hashPassword(answer.trim().toLowerCase());
+  const acc = { id: uid(), name, passwordHash: hash, securityQuestion: question, securityAnswerHash: answerHash };
+  accounts.push(acc);
+  saveAccounts(accounts);
+  session.accountId = acc.id;
+  session.accountName = acc.name;
+  state = emptyState();
+  resetOnboardUi();
+  ui.view = 'onboarding';
+  render();
+  toast('تم إنشاء الحساب، أهلاً ' + name);
+}
+
+function deleteAccount(id) {
+  const accounts = loadAccounts();
+  const acc = accounts.find((a) => a.id === id);
+  if (!acc) return;
+  if (!confirm(`تحذف حساب "${acc.name}" وكل بياناته نهائيًا؟ ما فيه رجعة.`)) return;
+  saveAccounts(accounts.filter((a) => a.id !== id));
+  try { localStorage.removeItem(stateKeyFor(id)); } catch (e) {}
+  render();
+  toast('تم حذف الحساب');
+}
+
+function openForgotPassword(id) {
+  pendingAccountId = id;
+  ui.view = 'forgotPassword';
+  render();
+}
+
+async function submitForgotPassword() {
+  const accounts = loadAccounts();
+  const acc = accounts.find((a) => a.id === pendingAccountId);
+  if (!acc) return;
+  const answer = document.getElementById('forgot-answer-input').value.trim().toLowerCase();
+  const err = document.getElementById('forgot-error');
+  if (!acc.securityAnswerHash) {
+    err.textContent = 'هالحساب ما فيه سؤال أمان محفوظ (سوّي قبل هالتحديث)، ما فيه طريقة استرجاع للأسف — احذف الحساب وسوّي وحد جديد';
+    return;
+  }
+  const answerHash = await hashPassword(answer);
+  if (answerHash !== acc.securityAnswerHash) {
+    err.textContent = 'الإجابة غلط';
+    return;
+  }
+  ui.view = 'resetPassword';
+  render();
+}
+
+async function submitResetPassword() {
+  const pw = document.getElementById('reset-pw-input').value;
+  const pw2 = document.getElementById('reset-pw2-input').value;
+  const err = document.getElementById('reset-error');
+  if (!/^\d{4}$/.test(pw)) { err.textContent = 'الرمز السري لازم يكون 4 أرقام بالضبط'; return; }
+  if (pw !== pw2) { err.textContent = 'الرمزين مو متطابقين'; return; }
+  const accounts = loadAccounts();
+  const acc = accounts.find((a) => a.id === pendingAccountId);
+  if (!acc) return;
+  acc.passwordHash = await hashPassword(pw);
+  saveAccounts(accounts);
+  session.accountId = acc.id;
+  session.accountName = acc.name;
+  state = loadStateFor(acc.id);
+  resetOnboardUi();
+  ui.view = state.onboarded ? 'dashboard' : 'onboarding';
+  render();
+  toast('تم تغيير الرمز السري، أهلاً ' + acc.name);
+}
+
+function legacyDataPending() {
+  try {
+    const legacy = localStorage.getItem(STORAGE_KEY);
+    const accounts = loadAccounts();
+    return !!legacy && accounts.length === 0;
+  } catch (e) { return false; }
+}
+
+async function submitMigrate() {
+  const name = document.getElementById('migrate-name-input').value.trim();
+  const pw = document.getElementById('migrate-pw-input').value;
+  const pw2 = document.getElementById('migrate-pw2-input').value;
+  const question = document.getElementById('migrate-question-input').value.trim();
+  const answer = document.getElementById('migrate-answer-input').value.trim();
+  const err = document.getElementById('migrate-error');
+  if (!name) { err.textContent = 'اكتب اسمك'; return; }
+  if (!/^\d{4}$/.test(pw)) { err.textContent = 'الرمز السري لازم يكون 4 أرقام بالضبط'; return; }
+  if (pw !== pw2) { err.textContent = 'كلمتا المرور مو متطابقتين'; return; }
+  if (!question || !answer) { err.textContent = 'سؤال الأمان والإجابة مطلوبين عشان تقدر تسترجع حسابك لو نسيت الرمز'; return; }
+  const legacyRaw = localStorage.getItem(STORAGE_KEY);
+  const hash = await hashPassword(pw);
+  const answerHash = await hashPassword(answer.trim().toLowerCase());
+  const acc = { id: uid(), name, passwordHash: hash, securityQuestion: question, securityAnswerHash: answerHash };
+  const accounts = loadAccounts();
+  accounts.push(acc);
+  saveAccounts(accounts);
+  try { localStorage.setItem(stateKeyFor(acc.id), legacyRaw); localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+  session.accountId = acc.id;
+  session.accountName = acc.name;
+  state = loadStateFor(acc.id);
+  if (!state.createdAt) {
+    const dates = [
+      ...state.transactions.map((t) => t.date),
+      ...state.history.map((h) => h.periodStart).filter(Boolean),
+    ];
+    state.createdAt = dates.length ? dates.reduce((min, d) => (d < min ? d : min), dates[0]) : new Date().toISOString();
+  }
+  resetOnboardUi();
+  ui.view = state.onboarded ? 'dashboard' : 'onboarding';
+  render();
+  toast('تم حفظ بياناتك القديمة بأمان تحت حسابك');
+}
+
 const ui = {
-  view: state.onboarded ? 'dashboard' : 'onboarding',
+  view: 'accountSelect',
   onboardStep: 0,
   onboardSalary: '',
   onboardCats: [],
   settingsCats: null,
   settingsDirty: false,
-  modal: null,
+  modal: null, // 'expense' | 'close' | 'addDebt' | 'payDebt'
   expenseCatId: null,
   payDebtId: null,
   debtExpanded: null,
+  historyExpanded: null,
   toast: null,
 };
 
+/* ---------------- toast ---------------- */
 let toastTimer = null;
 function toast(msg, tone) {
   ui.toast = { msg, tone: tone || 'sage' };
@@ -154,6 +366,7 @@ function renderToast() {
   el.innerHTML = `<div class="fixed top-4 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg shadow-lg text-sm font-bold z-50" style="background:${bg};color:#fff">${escapeHtml(ui.toast.msg)}</div>`;
 }
 
+/* ---------------- category row (shared: onboarding + settings) ---------------- */
 function catRowHTML(cat, salary) {
   const mode = cat.mode || 'percent';
   const value = mode === 'amount' ? Number(cat.amount || 0) : Number(cat.percent || 0);
@@ -256,6 +469,7 @@ function recalcTotals() {
   if (submitBtn) submitBtn.disabled = over || cats.length === 0;
 }
 
+/* ---------------- onboarding ---------------- */
 function onboardGoStep1() {
   const input = document.getElementById('onboard-salary-input');
   ui.onboardSalary = input.value;
@@ -277,10 +491,157 @@ function onboardSubmit() {
   state.salary = salary;
   state.categories = cats;
   state.wallets = wallets;
+  state.createdAt = state.createdAt || new Date().toISOString();
   saveState();
   ui.view = 'dashboard';
   render();
   toast('تم تجهيز محافظك، يعطيك العافية');
+}
+
+/* ---------------- accounts UI ---------------- */
+function renderAccountSelect() {
+  const accounts = loadAccounts();
+  const list = accounts.map((a) => `
+    <div class="flex items-center gap-2 mb-2">
+      <button onclick="selectAccount('${a.id}')" class="flex-1 flex items-center gap-3 rounded-xl p-3 bg-paper active:opacity-80">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center bg-teal text-white font-bold shrink-0">${escapeHtml((a.name || '؟')[0])}</div>
+        <span class="font-bold flex-1 text-right">${escapeHtml(a.name)}</span>
+        <span class="opacity-40 text-sm">🔒</span>
+      </button>
+      <button onclick="deleteAccount('${a.id}')" class="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 bg-paper opacity-50 active:opacity-90">🗑️</button>
+    </div>`).join('');
+  return `
+    <div class="mb-6 text-center pt-8">
+      <div class="text-3xl mb-2">💰</div>
+      <h2 class="font-display text-2xl font-extrabold text-teal">دفتر</h2>
+      <p class="text-sm opacity-70 mt-1">اختر حسابك</p>
+    </div>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      ${list || '<p class="text-sm opacity-60 text-center py-4">ما فيه حسابات بعد، ابدأ بحساب جديد</p>'}
+      <button onclick="ui.view='createAccount';render()" class="w-full mt-2 rounded-lg py-3 font-bold text-white bg-teal">+ حساب جديد</button>
+    </div>`;
+}
+
+function renderAccountPassword() {
+  const accounts = loadAccounts();
+  const acc = accounts.find((a) => a.id === pendingAccountId);
+  if (!acc) { ui.view = 'accountSelect'; return renderAccountSelect(); }
+  return `
+    <div class="mb-6 text-center pt-8">
+      <div class="w-14 h-14 rounded-full flex items-center justify-center bg-teal text-white font-bold text-xl mx-auto mb-3">${escapeHtml((acc.name || '؟')[0])}</div>
+      <h2 class="font-display text-xl font-extrabold text-teal">${escapeHtml(acc.name)}</h2>
+    </div>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      <label class="block text-sm font-bold mb-2 text-center">الرمز السري (٤ أرقام)</label>
+      <input id="login-password-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" autofocus
+        class="w-full rounded-lg px-4 py-3 text-2xl font-bold outline-none border mb-2 text-center tracking-[0.5em]"
+        style="background:#F2ECDC;border-color:#0F3D3E22"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();submitLogin();}" />
+      <div id="login-error" class="text-xs font-bold text-rust mb-2 text-center"></div>
+      <button onclick="submitLogin()" class="w-full rounded-lg py-3 font-bold text-white bg-teal">دخول</button>
+      <button onclick="openForgotPassword('${acc.id}')" class="w-full mt-2 rounded-lg py-2 text-xs font-bold text-brass">نسيت الرمز السري؟</button>
+      <button onclick="ui.view='accountSelect';render()" class="w-full mt-1 rounded-lg py-2.5 text-sm font-bold text-teal">رجوع لكل الحسابات</button>
+    </div>`;
+}
+
+function renderCreateAccount() {
+  return `
+    <div class="mb-6 text-center pt-8">
+      <h2 class="font-display text-xl font-extrabold text-teal">حساب جديد</h2>
+      <p class="text-sm opacity-70 mt-1">لكل شخص حسابه وميزانيته الخاصة، محد يشوف فلوس محد</p>
+    </div>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      <label class="block text-sm font-bold mb-2">الاسم</label>
+      <input id="create-name-input" placeholder="مثال: أمي" autofocus
+        class="w-full rounded-lg px-4 py-3 text-sm font-bold outline-none border mb-3" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <label class="block text-sm font-bold mb-2 text-center">الرمز السري (٤ أرقام)</label>
+      <input id="create-pw-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••"
+        class="w-full rounded-lg px-4 py-3 text-2xl font-bold outline-none border mb-3 text-center tracking-[0.5em]" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <label class="block text-sm font-bold mb-2 text-center">تأكيد الرمز السري</label>
+      <input id="create-pw2-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••"
+        class="w-full rounded-lg px-4 py-3 text-2xl font-bold outline-none border mb-3 text-center tracking-[0.5em]" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <div class="rounded-lg p-3 mb-3 bg-paper">
+        <p class="text-xs opacity-60 mb-2">لو نسيت رمزك بعدين، هالسؤال يرجعك لحسابك</p>
+        <label class="block text-xs font-bold mb-1.5">سؤال أمان (تختاره أنت)</label>
+        <input id="create-question-input" placeholder="مثال: وين درست؟"
+          class="w-full rounded-lg px-3 py-2 text-sm outline-none border mb-2" style="background:#FBF8EF;border-color:#0F3D3E22" />
+        <label class="block text-xs font-bold mb-1.5">الإجابة</label>
+        <input id="create-answer-input" placeholder="جوابك"
+          class="w-full rounded-lg px-3 py-2 text-sm outline-none border" style="background:#FBF8EF;border-color:#0F3D3E22" />
+      </div>
+      <div id="create-error" class="text-xs font-bold text-rust mb-2 text-center"></div>
+      <button onclick="submitCreateAccount()" class="w-full rounded-lg py-3 font-bold text-white bg-rust">إنشاء الحساب</button>
+      <button onclick="ui.view='accountSelect';render()" class="w-full mt-2 rounded-lg py-2.5 text-sm font-bold text-teal">رجوع</button>
+    </div>`;
+}
+
+function renderForgotPassword() {
+  const accounts = loadAccounts();
+  const acc = accounts.find((a) => a.id === pendingAccountId);
+  if (!acc) { ui.view = 'accountSelect'; return renderAccountSelect(); }
+  return `
+    <div class="mb-6 text-center pt-8">
+      <h2 class="font-display text-xl font-extrabold text-teal">استرجاع الرمز — ${escapeHtml(acc.name)}</h2>
+    </div>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      <label class="block text-sm font-bold mb-2">${acc.securityQuestion ? escapeHtml(acc.securityQuestion) : 'ما فيه سؤال أمان محفوظ لهالحساب'}</label>
+      <input id="forgot-answer-input" placeholder="جوابك" autofocus
+        class="w-full rounded-lg px-4 py-3 text-sm font-bold outline-none border mb-2" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <div id="forgot-error" class="text-xs font-bold text-rust mb-2"></div>
+      <button onclick="submitForgotPassword()" class="w-full rounded-lg py-3 font-bold text-white bg-teal">تأكيد</button>
+      <button onclick="ui.view='accountPassword';render()" class="w-full mt-2 rounded-lg py-2.5 text-sm font-bold text-teal">رجوع</button>
+      <div class="mt-4 pt-4 border-t" style="border-color:#0F3D3E14">
+        <p class="text-xs opacity-60 mb-2 text-center">ما تذكر الإجابة؟ تقدر تحذف الحساب وتبدأ من جديد (بيفقد بياناته)</p>
+        <button onclick="deleteAccount('${acc.id}')" class="w-full rounded-lg py-2.5 text-xs font-bold text-rust">حذف هالحساب نهائيًا</button>
+      </div>
+    </div>`;
+}
+
+function renderResetPassword() {
+  return `
+    <div class="mb-6 text-center pt-8">
+      <h2 class="font-display text-xl font-extrabold text-teal">رمز سري جديد</h2>
+    </div>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      <label class="block text-sm font-bold mb-2 text-center">الرمز الجديد (٤ أرقام)</label>
+      <input id="reset-pw-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••" autofocus
+        class="w-full rounded-lg px-4 py-3 text-2xl font-bold outline-none border mb-3 text-center tracking-[0.5em]" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <label class="block text-sm font-bold mb-2 text-center">تأكيد الرمز الجديد</label>
+      <input id="reset-pw2-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••"
+        class="w-full rounded-lg px-4 py-3 text-2xl font-bold outline-none border mb-2 text-center tracking-[0.5em]" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <div id="reset-error" class="text-xs font-bold text-rust mb-2 text-center"></div>
+      <button onclick="submitResetPassword()" class="w-full rounded-lg py-3 font-bold text-white bg-rust">حفظ ودخول</button>
+    </div>`;
+}
+
+function renderMigrate() {
+  return `
+    <div class="mb-6 text-center pt-8">
+      <h2 class="font-display text-xl font-extrabold text-teal">لقينا بيانات محفوظة عندك</h2>
+      <p class="text-sm opacity-70 mt-1">سوّي حساب برمز سري عشان نحافظ عليها ونربطها فيك — بياناتك القديمة بتضل موجودة زي ماهي</p>
+    </div>
+    <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
+      <label class="block text-sm font-bold mb-2">الاسم</label>
+      <input id="migrate-name-input" placeholder="اسمك" autofocus
+        class="w-full rounded-lg px-4 py-3 text-sm font-bold outline-none border mb-3" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <label class="block text-sm font-bold mb-2 text-center">الرمز السري (٤ أرقام)</label>
+      <input id="migrate-pw-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••"
+        class="w-full rounded-lg px-4 py-3 text-2xl font-bold outline-none border mb-3 text-center tracking-[0.5em]" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <label class="block text-sm font-bold mb-2 text-center">تأكيد الرمز السري</label>
+      <input id="migrate-pw2-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="••••"
+        class="w-full rounded-lg px-4 py-3 text-2xl font-bold outline-none border mb-3 text-center tracking-[0.5em]" style="background:#F2ECDC;border-color:#0F3D3E22" />
+      <div class="rounded-lg p-3 mb-3 bg-paper">
+        <p class="text-xs opacity-60 mb-2">لو نسيت رمزك بعدين، هالسؤال يرجعك لحسابك</p>
+        <label class="block text-xs font-bold mb-1.5">سؤال أمان (تختاره أنت)</label>
+        <input id="migrate-question-input" placeholder="مثال: وين درست؟"
+          class="w-full rounded-lg px-3 py-2 text-sm outline-none border mb-2" style="background:#FBF8EF;border-color:#0F3D3E22" />
+        <label class="block text-xs font-bold mb-1.5">الإجابة</label>
+        <input id="migrate-answer-input" placeholder="جوابك"
+          class="w-full rounded-lg px-3 py-2 text-sm outline-none border" style="background:#FBF8EF;border-color:#0F3D3E22" />
+      </div>
+      <div id="migrate-error" class="text-xs font-bold text-rust mb-2 text-center"></div>
+      <button onclick="submitMigrate()" class="w-full rounded-lg py-3 font-bold text-white bg-rust">حفظ وتسجيل الدخول</button>
+    </div>`;
 }
 
 function renderOnboarding() {
@@ -324,6 +685,7 @@ function renderOnboarding() {
     </div>`;
 }
 
+/* ---------------- dashboard ---------------- */
 function openExpenseModal() {
   ui.modal = 'expense';
   ui.expenseCatId = state.categories[0] ? state.categories[0].id : null;
@@ -391,7 +753,9 @@ function submitCloseMonth() {
     const w = state.wallets[c.id] || { budget: 0, spent: 0 };
     return { catId: c.id, name: c.name, budget: w.budget, spent: w.spent, remaining: w.budget - w.spent };
   });
-  state.history.unshift({ id: uid(), closedAt: new Date().toISOString(), salary: state.salary, rows });
+  const periodEnd = new Date().toISOString();
+  const periodStart = state.history.length > 0 ? state.history[0].periodEnd : (state.createdAt || periodEnd);
+  state.history.unshift({ id: uid(), closedAt: periodEnd, periodStart, periodEnd, salary: state.salary, rows });
   const wallets = {};
   state.categories.forEach((c) => {
     const row = rows.find((r) => r.catId === c.id);
@@ -437,6 +801,47 @@ function walletCardHTML(cat, wallet) {
     </div>`;
 }
 
+function currentPeriodStart() {
+  return state.history.length > 0 ? state.history[0].periodEnd : (state.createdAt || null);
+}
+
+function groupTxByDate(txs) {
+  const groups = [];
+  const map = {};
+  txs.forEach((tx) => {
+    const d = new Date(tx.date);
+    const key = d.toLocaleDateString('ar-QA', { year: 'numeric', month: 'long', day: 'numeric' });
+    if (!map[key]) { map[key] = []; groups.push(key); }
+    map[key].push(tx);
+  });
+  return groups.map((key) => ({ label: key, txs: map[key] }));
+}
+
+function txListHTML(txs, deletable) {
+  if (!txs.length) return '<p class="text-xs opacity-50 text-center py-4">ما فيه حركات بهالفترة</p>';
+  const sorted = [...txs].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const groups = groupTxByDate(sorted);
+  return groups.map((g) => `
+    <div class="mb-3">
+      <div class="text-[11px] font-bold opacity-50 mb-1.5">${g.label}</div>
+      <div class="space-y-1.5">
+        ${g.txs.map((tx) => {
+          const cat = state.categories.find((c) => c.id === tx.catId);
+          return `
+            <div class="flex items-center gap-3 rounded-xl px-3 py-2.5 bg-card border" style="border-color:#0F3D3E10">
+              <div class="w-8 h-8 rounded-md flex items-center justify-center shrink-0 bg-paper text-sm">${cat ? ICON(cat.name) : '❓'}</div>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-bold truncate">${cat ? escapeHtml(cat.name) : 'محفظة محذوفة'}</div>
+                ${tx.note ? `<div class="text-xs opacity-55 truncate">${escapeHtml(tx.note)}</div>` : ''}
+              </div>
+              <div class="text-sm font-extrabold shrink-0 text-rust">-${fmt(tx.amount)}</div>
+              ${deletable ? `<button onclick="deleteTransaction('${tx.id}')" class="opacity-30 active:opacity-70 shrink-0">🗑️</button>` : ''}
+            </div>`;
+        }).join('')}
+      </div>
+    </div>`).join('');
+}
+
 function renderDashboard() {
   const totalBudget = state.categories.reduce((s, c) => s + ((state.wallets[c.id] || {}).budget || 0), 0);
   const totalSpent = state.categories.reduce((s, c) => s + ((state.wallets[c.id] || {}).spent || 0), 0);
@@ -444,19 +849,8 @@ function renderDashboard() {
 
   const cards = state.categories.map((c) => walletCardHTML(c, state.wallets[c.id] || { budget: 0, spent: 0 })).join('');
 
-  const txRows = state.transactions.slice(0, 12).map((tx) => {
-    const cat = state.categories.find((c) => c.id === tx.catId);
-    return `
-      <div class="flex items-center gap-3 rounded-xl px-3 py-2.5 bg-card border" style="border-color:#0F3D3E10">
-        <div class="w-8 h-8 rounded-md flex items-center justify-center shrink-0 bg-paper text-sm">${cat ? ICON(cat.name) : '❓'}</div>
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-bold truncate">${cat ? escapeHtml(cat.name) : 'محفظة محذوفة'}</div>
-          ${tx.note ? `<div class="text-xs opacity-55 truncate">${escapeHtml(tx.note)}</div>` : ''}
-        </div>
-        <div class="text-sm font-extrabold shrink-0 text-rust">-${fmt(tx.amount)}</div>
-        <button onclick="deleteTransaction('${tx.id}')" class="opacity-30 active:opacity-70 shrink-0">🗑️</button>
-      </div>`;
-  }).join('');
+  const periodStart = currentPeriodStart();
+  const currentTxs = periodStart ? state.transactions.filter((t) => t.date >= periodStart) : state.transactions;
 
   return `
     <div class="grid grid-cols-3 gap-2 mb-5">
@@ -477,14 +871,14 @@ function renderDashboard() {
     <button onclick="openCloseMonthModal()" class="w-full mt-6 rounded-xl py-3 font-bold flex items-center justify-center gap-2 border-2 border-dashed text-teal" style="border-color:#0F3D3E44">
       📅 إنهاء الشهر وبدء شهر جديد
     </button>
-    ${state.transactions.length > 0 ? `
-      <div class="mt-8">
-        <h3 class="font-display font-extrabold text-sm mb-3 opacity-70">آخر الحركات</h3>
-        <div class="space-y-2">${txRows}</div>
-      </div>` : ''}
+    <div class="mt-8">
+      <h3 class="font-display font-extrabold text-sm mb-3 opacity-70">حركات هالفترة (بالتاريخ)</h3>
+      ${txListHTML(currentTxs, true)}
+    </div>
   `;
 }
 
+/* ---------------- debts ---------------- */
 function addDebt() {
   const name = document.getElementById('debt-name-input').value;
   const total = Number(document.getElementById('debt-total-input').value || 0);
@@ -611,6 +1005,12 @@ function renderDebts() {
     <div class="space-y-3">${cards}</div>`;
 }
 
+/* ---------------- history ---------------- */
+function toggleHistoryExpand(id) {
+  ui.historyExpanded = ui.historyExpanded === id ? null : id;
+  render();
+}
+
 function renderHistory() {
   if (state.history.length === 0) {
     return `<div class="text-center py-16 opacity-50"><div class="text-2xl mb-3">🧾</div><p class="text-sm">ما فيه شهور مؤرشفة بعد</p></div>`;
@@ -623,6 +1023,10 @@ function renderHistory() {
         <span class="opacity-80">${escapeHtml(r.name)}</span>
         <span class="font-bold" style="color:${r.remaining < 0 ? '#A6432F' : '#4C7A5E'}">${r.remaining < 0 ? '-' : '+'}${fmt(Math.abs(r.remaining))} ر.ق</span>
       </div>`).join('');
+    const expanded = ui.historyExpanded === h.id;
+    const periodTxs = (h.periodStart || h.periodEnd)
+      ? state.transactions.filter((t) => t.date >= (h.periodStart || '') && t.date < h.periodEnd)
+      : [];
     return `
       <div class="rounded-2xl p-4 bg-card border" style="border-color:#0F3D3E14">
         <div class="flex items-center justify-between mb-2">
@@ -631,11 +1035,16 @@ function renderHistory() {
         </div>
         <div class="text-xs opacity-60 mb-3">اتصرف ${fmt(totalSpent)} من ${fmt(totalBudget)} ر.ق</div>
         <div class="space-y-1.5">${rows}</div>
+        <button onclick="toggleHistoryExpand('${h.id}')" class="mt-3 text-xs font-bold text-teal">
+          ${expanded ? 'إخفاء تفاصيل الحركات' : 'عرض كل حركات هالشهر بالتاريخ'}
+        </button>
+        ${expanded ? `<div class="mt-3 pt-3 border-t" style="border-color:#0F3D3E14">${txListHTML(periodTxs, false)}</div>` : ''}
       </div>`;
   }).join('');
   return `<h2 class="font-display text-lg font-extrabold mb-1 text-teal">الأرشيف</h2><div class="space-y-4 mt-4">${cards}</div>`;
 }
 
+/* ---------------- settings ---------------- */
 function settingsSave() {
   const cats = readAllRows().map((c) => ({ ...c, percent: Number(c.percent), amount: Number(c.amount) }));
   const wallets = { ...state.wallets };
@@ -681,6 +1090,7 @@ function renderSettings() {
     </div>`;
 }
 
+/* ---------------- modals ---------------- */
 function renderModals() {
   if (ui.modal === 'expense') {
     const cats = state.categories.map((c) => `
@@ -764,28 +1174,34 @@ function modalShell(title, body) {
     </div>`;
 }
 
+/* ---------------- header / shell ---------------- */
 function setView(v) { ui.view = v; ui.modal = null; render(); }
 function tabBtn(view, label) {
   const active = ui.view === view;
-  return `<button onclick="setView('${view}')" class="text-[12px] px-2 py-1.5 rounded-md font-medium whitespace-nowrap transition-colors"
-    style="background:${active ? 'rgba(184,134,59,0.25)' : 'transparent'};color:${active ? '#B8863B' : 'rgba(255,255,255,0.65)'}">${label}</button>`;
+  return `<button onclick="setView('${view}')" class="text-[13px] px-3 py-2.5 rounded-lg font-bold whitespace-nowrap transition-colors"
+    style="background:${active ? 'rgba(184,134,59,0.28)' : 'rgba(255,255,255,0.06)'};color:${active ? '#B8863B' : 'rgba(255,255,255,0.75)'}">${label}</button>`;
 }
+const AUTH_VIEWS = ['accountSelect', 'accountPassword', 'createAccount', 'migrate', 'forgotPassword', 'resetPassword'];
 function renderHeader() {
-  if (ui.view === 'onboarding') return '';
+  if (ui.view === 'onboarding' || AUTH_VIEWS.includes(ui.view)) return '';
   return `
-    <header class="bg-teal text-white">
-      <div class="max-w-2xl mx-auto px-4 pt-6 pb-4">
-        <div class="flex items-center justify-between">
+    <header class="bg-teal text-white" style="padding-top:env(safe-area-inset-top)">
+      <div class="max-w-2xl mx-auto px-4 pt-4 pb-3">
+        <div class="flex items-center justify-between mb-3">
           <div class="flex items-center gap-2.5">
-            <div class="w-9 h-9 rounded-md flex items-center justify-center bg-brass text-base">🐷</div>
+            <div class="w-9 h-9 rounded-md flex items-center justify-center bg-brass text-base shrink-0">💰</div>
             <h1 class="font-display text-xl font-extrabold tracking-tight">دفتر</h1>
           </div>
-          <div class="flex gap-1">
-            ${tabBtn('dashboard', 'المحافظ')}
-            ${tabBtn('debts', 'الديون')}
-            ${tabBtn('history', 'الأرشيف')}
-            ${tabBtn('settings', 'الإعدادات')}
-          </div>
+          <button onclick="logout()" class="flex items-center gap-1.5 text-xs font-bold opacity-75 active:opacity-100 shrink-0">
+            <span class="truncate max-w-[80px]">${escapeHtml(session.accountName || '')}</span>
+            <span>🚪</span>
+          </button>
+        </div>
+        <div class="flex gap-1.5 overflow-x-auto -mx-1 px-1">
+          ${tabBtn('dashboard', 'المحافظ')}
+          ${tabBtn('debts', 'الديون')}
+          ${tabBtn('history', 'الأرشيف')}
+          ${tabBtn('settings', 'الإعدادات')}
         </div>
       </div>
       <div style="height:3px;background:linear-gradient(90deg,transparent,#B8863B,transparent)"></div>
@@ -807,8 +1223,19 @@ function renderFab() {
 }
 
 function render() {
+  // gate: must be logged in for anything except the auth screens
+  if (!session.accountId && !AUTH_VIEWS.includes(ui.view)) {
+    ui.view = legacyDataPending() ? 'migrate' : 'accountSelect';
+  }
+
   let main = '';
-  if (ui.view === 'onboarding') main = renderOnboarding();
+  if (ui.view === 'accountSelect') main = renderAccountSelect();
+  else if (ui.view === 'accountPassword') main = renderAccountPassword();
+  else if (ui.view === 'createAccount') main = renderCreateAccount();
+  else if (ui.view === 'migrate') main = renderMigrate();
+  else if (ui.view === 'forgotPassword') main = renderForgotPassword();
+  else if (ui.view === 'resetPassword') main = renderResetPassword();
+  else if (ui.view === 'onboarding') main = renderOnboarding();
   else if (ui.view === 'dashboard') main = renderDashboard();
   else if (ui.view === 'debts') main = renderDebts();
   else if (ui.view === 'history') main = renderHistory();
@@ -827,6 +1254,7 @@ function render() {
   renderToast();
 }
 
+if (!session.accountId && legacyDataPending()) { ui.view = 'migrate'; }
 render();
 </script>
 </body>
